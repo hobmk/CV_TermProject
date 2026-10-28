@@ -1,0 +1,14 @@
+﻿numpy
+pandas
+yfinance
+matplotlib
+mplfinance
+Pillow
+scikit-learn
+timm
+einops
+tensorboard
+tqdm
+PyYAML
+pytest
+ruff

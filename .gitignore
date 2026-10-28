@@ -1,0 +1,36 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+
+# Datasets
+data/raw/*
+data/processed/*
+data/charts/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/charts/.gitkeep
+
+# Experiment outputs
+outputs/checkpoints/*
+outputs/metrics/*
+outputs/figures/*
+!outputs/checkpoints/.gitkeep
+!outputs/metrics/.gitkeep
+!outputs/figures/.gitkeep
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
