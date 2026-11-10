@@ -1,0 +1,9 @@
+{
+  "normalization": "first_day_close",
+  "window": 20,
+  "quantile": 0.995,
+  "price_axis_min_return": -0.40391441671867356,
+  "price_axis_max_return": 0.40391441671867356,
+  "train_windows": 5217,
+  "train_window_clipping_ratio": 0.005175388154111558
+}

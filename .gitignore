@@ -15,6 +15,7 @@ venv/
 .vscode/
 
 # Datasets
+data
 data/raw/*
 data/processed/*
 data/charts/*
@@ -23,6 +24,7 @@ data/charts/*
 !data/charts/.gitkeep
 
 # Experiment outputs
+outputs
 outputs/checkpoints/*
 outputs/metrics/*
 outputs/figures/*

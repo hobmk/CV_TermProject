@@ -17,9 +17,6 @@ from src.models.standard_vit import StandardViT
 from src.models.day_aligned_vit import DayAlignedViT
 
 
-MODEL_NAMES = ("cnn", "standard_vit", "day_aligned_vit")
-
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -32,7 +29,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def build_model(model_name):
+def build_model(model_name, pooling="cls"):
     if model_name == "cnn":
         config = {}
         model = CNNBaseline()
@@ -54,10 +51,11 @@ def build_model(model_name):
             "image_size": 160,
             "num_days": 20,
             "embed_dim": 128,
-            "depth": 4,
+            "depth": 2,
             "num_heads": 4,
             "dropout": 0.1,
             "num_classes": 2,
+            "pooling": pooling,
         }
         model = DayAlignedViT(**config)
 
@@ -67,13 +65,19 @@ def build_model(model_name):
     return model, config
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None):
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    device,
+    optimizer=None,
+    grad_clip=0.0,
+):
     training = optimizer is not None
     model.train(training)
 
     total_loss = 0.0
     total_count = 0
-
     all_labels = []
     all_probs = []
 
@@ -90,6 +94,13 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
 
             if training:
                 loss.backward()
+
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=grad_clip,
+                    )
+
                 optimizer.step()
 
         batch_size = targets.size(0)
@@ -108,22 +119,29 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
             probs.cpu().numpy().tolist()
         )
 
-    metrics = compute_metrics(all_labels, all_probs)
+    probs_array = np.asarray(all_probs)
 
     return {
         "loss": total_loss / total_count,
-        **metrics,
+        **compute_metrics(all_labels, all_probs),
+        "pred_up_ratio": float(
+            (probs_array >= 0.5).mean()
+        ),
+        "prob_std": float(probs_array.std()),
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model", choices=MODEL_NAMES, default="cnn")
+    parser.add_argument("--model", choices=["cnn", "standard_vit", "day_aligned_vit"], default="cnn")
+    parser.add_argument("--pooling", choices=["cls", "mean"], default="cls")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=0.0003)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--grad-clip", type=float, default=0.0)
+    parser.add_argument("--monitor", choices=["macro_f1", "auroc"], default="macro_f1")
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-name", type=str, default=None)
@@ -131,20 +149,17 @@ def main():
 
     args = parser.parse_args()
 
-    if args.epochs < 1:
-        parser.error("--epochs must be >= 1")
+    if args.epochs < 1 or args.batch_size < 1:
+        parser.error("epochs and batch-size must be positive")
 
-    if args.batch_size < 1:
-        parser.error("--batch-size must be >= 1")
+    if args.patience < 1 or args.num_workers < 0:
+        parser.error("Invalid patience or num-workers")
 
-    if args.patience < 1:
-        parser.error("--patience must be >= 1")
+    if args.lr <= 0 or args.grad_clip < 0:
+        parser.error("Invalid lr or grad-clip")
 
-    if args.num_workers < 0:
-        parser.error("--num-workers must be >= 0")
-
-    if args.lr <= 0:
-        parser.error("--lr must be > 0")
+    if args.model != "day_aligned_vit" and args.pooling != "cls":
+        parser.error("--pooling mean currently supports day_aligned_vit only")
 
     set_seed(args.seed)
 
@@ -157,14 +172,11 @@ def main():
     if device.type == "cuda":
         print(f"[GPU] {torch.cuda.get_device_name(0)}")
 
-    # --------------------------------------------------
-    # Dataset / DataLoader
-    # --------------------------------------------------
-    train_dataset = ChartDataset("train")
-    val_dataset = ChartDataset("val")
+    train_ds = ChartDataset("train")
+    val_ds = ChartDataset("val")
 
     train_loader = DataLoader(
-        train_dataset,
+        train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -172,17 +184,18 @@ def main():
     )
 
     val_loader = DataLoader(
-        val_dataset,
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
 
-    # --------------------------------------------------
-    # Model
-    # --------------------------------------------------
-    model, model_config = build_model(args.model)
+    model, config = build_model(
+        args.model,
+        pooling=args.pooling,
+    )
+
     model = model.to(device)
 
     num_params = sum(
@@ -190,12 +203,9 @@ def main():
     )
 
     print(f"[MODEL] {args.model}")
+    print(f"[CONFIG] {config}")
     print(f"[PARAMETERS] {num_params:,}")
-    print(f"[CONFIG] {model_config}")
 
-    # --------------------------------------------------
-    # Loss / Optimizer
-    # --------------------------------------------------
     criterion = nn.CrossEntropyLoss()
 
     optimizer = torch.optim.AdamW(
@@ -204,89 +214,66 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # --------------------------------------------------
-    # Output paths
-    # --------------------------------------------------
     run_name = (
         args.run_name
-        if args.run_name
-        else f"{args.model}_seed{args.seed}"
+        or f"{args.model}_{args.pooling}_seed{args.seed}"
     )
 
-    checkpoint_dir = Path("outputs/checkpoints")
-    metrics_dir = Path("outputs/metrics")
+    ckpt_dir = Path("outputs/checkpoints")
+    metric_dir = Path("outputs/metrics")
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    metrics_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    metric_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = checkpoint_dir / f"{run_name}.pt"
-    history_path = metrics_dir / f"{run_name}_history.csv"
+    ckpt_path = ckpt_dir / f"{run_name}.pt"
+    history_path = metric_dir / f"{run_name}_history.csv"
 
-    # --------------------------------------------------
-    # Early stopping
-    # --------------------------------------------------
-    best_f1 = -1.0
+    best_score = -float("inf")
     best_loss = float("inf")
     best_epoch = 0
-    patience_counter = 0
-
+    best_metrics = {}
+    stale = 0
     history = []
+
     start_time = time.perf_counter()
 
     print("\n[TRAINING START]")
     print(
-        f"Model={args.model} "
-        f"| Epochs={args.epochs} "
-        f"| Batch={args.batch_size} "
-        f"| LR={args.lr} "
-        f"| WeightDecay={args.weight_decay} "
-        f"| Patience={args.patience} "
-        f"| Seed={args.seed}"
+        f"Model={args.model} | Pooling={args.pooling} "
+        f"| Monitor={args.monitor} "
+        f"| GradClip={args.grad_clip} "
+        f"| Patience={args.patience}"
     )
-    print("-" * 110)
 
     for epoch in range(1, args.epochs + 1):
-
-        # --------------------------------------------------
-        # Train
-        # --------------------------------------------------
-        train_metrics = run_epoch(
-            model=model,
-            loader=train_loader,
-            criterion=criterion,
-            device=device,
+        train = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            device,
             optimizer=optimizer,
+            grad_clip=args.grad_clip,
         )
 
-        # --------------------------------------------------
-        # Validation
-        # --------------------------------------------------
-        val_metrics = run_epoch(
-            model=model,
-            loader=val_loader,
-            criterion=criterion,
-            device=device,
-            optimizer=None,
+        val = run_epoch(
+            model,
+            val_loader,
+            criterion,
+            device,
         )
 
         elapsed = time.perf_counter() - start_time
 
-        # --------------------------------------------------
-        # Save epoch history
-        # --------------------------------------------------
         row = {
             "epoch": epoch,
             "elapsed_sec": round(elapsed, 2),
         }
 
         row.update({
-            f"train_{key}": value
-            for key, value in train_metrics.items()
+            f"train_{k}": v for k, v in train.items()
         })
-
         row.update({
-            f"val_{key}": value
-            for key, value in val_metrics.items()
+            f"val_{k}": v for k, v in val.items()
         })
 
         history.append(row)
@@ -296,99 +283,86 @@ def main():
             index=False,
         )
 
-        # --------------------------------------------------
-        # Best model selection
-        # Primary: Validation Macro F1
-        # Tie-breaker: Validation Loss
-        # --------------------------------------------------
-        current_f1 = val_metrics["macro_f1"]
-        current_loss = val_metrics["loss"]
+        score = val[args.monitor]
 
         improved = (
-            current_f1 > best_f1 + 1e-6
+            score > best_score + 1e-6
             or (
-                abs(current_f1 - best_f1) <= 1e-6
-                and current_loss < best_loss - 1e-6
+                abs(score - best_score) <= 1e-6
+                and val["loss"] < best_loss - 1e-6
             )
         )
 
         if improved:
-            best_f1 = current_f1
-            best_loss = current_loss
+            best_score = score
+            best_loss = val["loss"]
             best_epoch = epoch
-            patience_counter = 0
-
-            checkpoint = {
-                "model_name": args.model,
-                "model_config": model_config,
-                "model_state": model.state_dict(),
-                "seed": args.seed,
-                "epoch": epoch,
-                "train_metrics": train_metrics,
-                "val_metrics": val_metrics,
-                "normalization": "window_minmax",
-                "window": 20,
-                "horizon": 5,
-                "stride": 1,
-                "learning_rate": args.lr,
-                "batch_size": args.batch_size,
-                "weight_decay": args.weight_decay,
-                "num_parameters": num_params,
-            }
+            best_metrics = dict(val)
+            stale = 0
 
             torch.save(
-                checkpoint,
-                checkpoint_path,
+                {
+                    "model_name": args.model,
+                    "model_config": config,
+                    "model_state": model.state_dict(),
+                    "seed": args.seed,
+                    "epoch": epoch,
+                    "train_metrics": train,
+                    "val_metrics": val,
+                    "monitor": args.monitor,
+                    "grad_clip": args.grad_clip,
+                    "normalization": "window_minmax",
+                    "window": 20,
+                    "horizon": 5,
+                    "stride": 1,
+                    "learning_rate": args.lr,
+                    "batch_size": args.batch_size,
+                    "weight_decay": args.weight_decay,
+                    "num_parameters": num_params,
+                },
+                ckpt_path,
             )
-
         else:
-            patience_counter += 1
+            stale += 1
 
-        # --------------------------------------------------
-        # Terminal output
-        # --------------------------------------------------
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} "
-            f"| train_loss={train_metrics['loss']:.4f} "
-            f"| val_loss={val_metrics['loss']:.4f} "
-            f"| train_acc={train_metrics['accuracy']:.4f} "
-            f"| train_f1={train_metrics['macro_f1']:.4f} "
-            f"| val_acc={val_metrics['accuracy']:.4f} "
-            f"| val_bal={val_metrics['balanced_accuracy']:.4f} "
-            f"| val_f1={val_metrics['macro_f1']:.4f} "
-            f"| val_auc={val_metrics['auroc']:.4f} "
+            f"| train_loss={train['loss']:.4f} "
+            f"| train_f1={train['macro_f1']:.4f} "
+            f"| val_loss={val['loss']:.4f} "
+            f"| val_acc={val['accuracy']:.4f} "
+            f"| val_bal={val['balanced_accuracy']:.4f} "
+            f"| val_f1={val['macro_f1']:.4f} "
+            f"| val_auc={val['auroc']:.4f} "
+            f"| up_ratio={val['pred_up_ratio']:.3f} "
+            f"| prob_std={val['prob_std']:.6f} "
             f"| best={best_epoch} "
-            f"| patience={patience_counter}/{args.patience} "
+            f"| patience={stale}/{args.patience} "
             f"| elapsed={elapsed:.0f}s",
             flush=True,
         )
 
-        # --------------------------------------------------
-        # Early stopping
-        # --------------------------------------------------
-        if patience_counter >= args.patience:
+        if stale >= args.patience:
             print(
-                f"\n[EARLY STOPPING] "
-                f"No improvement for {args.patience} epochs."
+                f"[EARLY STOP] No {args.monitor} improvement "
+                f"for {args.patience} epochs"
             )
             break
 
-    # --------------------------------------------------
-    # Final summary
-    # --------------------------------------------------
     total_time = time.perf_counter() - start_time
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 70)
     print("[TRAINING COMPLETED]")
-    print(f"Model       : {args.model}")
-    print(f"Seed        : {args.seed}")
-    print(f"Best Epoch  : {best_epoch}")
-    print(f"Best Val F1 : {best_f1:.4f}")
-    print(f"Total Time  : {total_time:.1f}s")
-    print(f"Checkpoint  : {checkpoint_path}")
-    print(f"History     : {history_path}")
-    print("=" * 80)
-
+    print(f"Model         : {args.model}")
+    print(f"Pooling       : {args.pooling}")
+    print(f"Best Epoch    : {best_epoch}")
+    print(f"Best Val {args.monitor}: {best_score:.4f}")
+    print(f"Best Val F1   : {best_metrics['macro_f1']:.4f}")
+    print(f"Best Val AUROC: {best_metrics['auroc']:.4f}")
+    print(f"Total Time    : {total_time:.1f}s")
+    print(f"Checkpoint    : {ckpt_path}")
+    print(f"History       : {history_path}")
+    print("=" * 70)
     print("[NOTE] Test set remains untouched.")
 
 
