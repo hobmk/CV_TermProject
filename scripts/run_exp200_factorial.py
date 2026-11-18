@@ -79,8 +79,8 @@ def prepare_data(root, raw_root):
 
 
 def split(meta, legacy, year, start_year, universe):
-    if year not in (2019, 2020, 2021):
-        raise ValueError("Evaluation years must be 2019/2020/2021")
+    if year not in (2017, 2018, 2019, 2020, 2021):
+        raise ValueError("Evaluation years must be 2017-2021")
     if start_year not in (2010, 2015):
         raise ValueError("Start years must be 2010/2015")
     if universe not in (100, 200):

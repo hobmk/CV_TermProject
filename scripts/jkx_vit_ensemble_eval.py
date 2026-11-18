@@ -292,8 +292,8 @@ def main():
 
     a = p.parse_args()
 
-    if not set(a.years).issubset({2019, 2020, 2021}):
-        p.error("Evaluation years must be 2019-2021")
+    if not set(a.years).issubset({2017, 2018, 2019, 2020, 2021}):
+        p.error("Evaluation years must be 2017-2021")
 
     if len(set(a.seeds)) != len(a.seeds) or len(a.seeds) < 2:
         p.error("Provide at least two distinct seeds")
@@ -445,7 +445,7 @@ def main():
     )
 
     display(
-        "[3-YEAR MEAN] Ensemble performance",
+        f"[{len(a.years)}-YEAR MEAN] Ensemble performance",
         averages,
         ["model"] + metric_cols,
     )

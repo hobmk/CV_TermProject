@@ -1,30 +1,50 @@
 
-"""MVO comparison using saved JKX CNN and Day-Aligned ViT ensembles.
+"""Point-in-time MVO comparison of JKX CNN and Day-Aligned ViT.
 
-2019: historical out-of-time predictions for return calibration.
-2020-2021: portfolio evaluation using information available at each date.
+2017 out-of-time predictions provide initial calibration.
+2018-2021 predictions are used for portfolio evaluation.
 
-Signals are observed at the decision-day close.
-Trades enter at the next trading day's open and exit five sessions later.
+Signals are observed at the decision-day CLOSE.
+Trades enter at the next trading day's adjusted OPEN.
+Trades exit five trading sessions later at adjusted OPEN.
+
+Calibration uses the same open-to-open return, and only
+after the corresponding exit price is observable.
+
 No 2022+ data are used.
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
 from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
 
 
-MODELS = {
-    "JKX_CNN": "exp200_factorial",
-    "DayAligned_ViT": "exp200_day_vit",
-}
+MODELS = (
+    "JKX_CNN",
+    "DayAligned_ViT",
+)
 
-KEYS = ["ticker", "decision_date", "target_date"]
-REQUIRED = KEYS + ["group", "label", "return_5d", "prob_up"]
+KEYS = [
+    "ticker",
+    "decision_date",
+    "target_date",
+]
+
+REQUIRED = KEYS + [
+    "group",
+    "label",
+    "return_5d",
+    "prob_up",
+]
+
+YEARS = range(2017, 2022)
+EVAL_YEARS = range(2018, 2022)
 
 
 def read_predictions(path, year):
@@ -41,8 +61,12 @@ def read_predictions(path, year):
         },
     )
 
-    if not set(REQUIRED).issubset(df.columns):
-        raise ValueError(f"Missing prediction fields: {path}")
+    missing = set(REQUIRED) - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Missing {sorted(missing)}: {path}"
+        )
 
     df = (
         df[REQUIRED]
@@ -50,257 +74,485 @@ def read_predictions(path, year):
         .reset_index(drop=True)
     )
 
-    if df.duplicated(["ticker", "decision_date"]).any():
-        raise ValueError(f"Duplicate ticker/date: {path}")
+    if df.duplicated(
+        ["ticker", "decision_date"]
+    ).any():
+        raise ValueError(
+            f"Duplicated ticker/date: {path}"
+        )
 
-    if not df.decision_date.str.startswith(str(year)).all():
-        raise ValueError(f"Test year mismatch: {path}")
+    if not df.decision_date.str.startswith(
+        str(year)
+    ).all():
+        raise ValueError(
+            f"Wrong year: {path}"
+        )
 
-    if not (
+    valid_dates = (
         (df.target_date > df.decision_date)
         & (df.target_date < "2022-01-01")
-    ).all():
-        raise ValueError(f"Invalid target date: {path}")
+    )
 
-    for col in ("label", "return_5d", "prob_up"):
-        if not np.isfinite(df[col].to_numpy(float)).all():
-            raise ValueError(f"Nonfinite {col}: {path}")
+    if not valid_dates.all():
+        raise ValueError(
+            f"Invalid future date: {path}"
+        )
+
+    for col in (
+        "label",
+        "return_5d",
+        "prob_up",
+    ):
+        if not np.isfinite(
+            df[col].to_numpy(float)
+        ).all():
+            raise ValueError(
+                f"Nonfinite {col}: {path}"
+            )
 
     if not df.prob_up.between(0, 1).all():
-        raise ValueError(f"Invalid probability: {path}")
+        raise ValueError(
+            f"Invalid probabilities: {path}"
+        )
 
-    expected = (df.return_5d.to_numpy(float) > 0).astype(int)
+    expected = (
+        df.return_5d.to_numpy(float) > 0
+    ).astype(int)
 
-    if not np.array_equal(df.label.to_numpy(int), expected):
-        raise ValueError(f"Incorrect return label: {path}")
+    if not np.array_equal(
+        df.label.to_numpy(int),
+        expected,
+    ):
+        raise ValueError(
+            f"Return/label mismatch: {path}"
+        )
 
     return df
 
 
-def ensemble_preds(base, year, seeds, legacy):
+def ensemble_preds(folder, year, seeds, legacy):
     reference = None
-    scores = []
+    probabilities = []
 
     for seed in seeds:
         path = (
-            base
+            folder
             / "u200_start2010"
             / f"test{year}"
             / f"seed{seed}"
             / "predictions.csv"
         )
 
-        df = read_predictions(path, year)
+        frame = read_predictions(
+            path,
+            year,
+        )
 
         if reference is None:
-            reference = df
-        else:
-            columns = KEYS + ["group", "label"]
+            reference = frame
 
-            if not reference[columns].equals(df[columns]):
+        else:
+            columns = KEYS + [
+                "group",
+                "label",
+            ]
+
+            if not reference[columns].equals(
+                frame[columns]
+            ):
                 raise ValueError(
-                    f"Seed alignment mismatch: {path}"
+                    f"Seed sample mismatch: {path}"
                 )
 
             if not np.allclose(
                 reference.return_5d,
-                df.return_5d,
-                rtol=0,
+                frame.return_5d,
                 atol=1e-10,
+                rtol=0,
             ):
                 raise ValueError(
-                    f"Future-return mismatch: {path}"
+                    f"Seed return mismatch: {path}"
                 )
 
-        scores.append(df.prob_up.to_numpy(float))
+        probabilities.append(
+            frame.prob_up.to_numpy(float)
+        )
 
-    mask = reference.ticker.isin(legacy).to_numpy()
+    mask = (
+        reference.ticker.isin(legacy)
+        .to_numpy()
+    )
 
-    out = reference.loc[mask].copy()
-    out["score"] = np.mean(scores, axis=0)[mask]
+    result = reference.loc[mask].copy()
 
-    if out.ticker.nunique() != 100:
-        raise ValueError("Expected 100 common stocks")
+    result["score"] = (
+        np.stack(probabilities)
+        .mean(axis=0)[mask]
+    )
 
-    counts = out.groupby("decision_date").ticker.nunique()
-
-    if not counts.eq(100).all():
-        raise ValueError("Expected 100 stocks per decision date")
+    counts = (
+        result.groupby("decision_date")
+        .ticker.nunique()
+    )
 
     if (
-        out.groupby("decision_date").target_date.nunique() != 1
-    ).any():
-        raise ValueError("Inconsistent target dates")
+        result.ticker.nunique() != 100
+        or not counts.eq(100).all()
+    ):
+        raise ValueError(
+            f"Not 100 stocks per day in {year}"
+        )
 
-    return out.reset_index(drop=True)
+    target_counts = (
+        result.groupby("decision_date")
+        .target_date.nunique()
+    )
+
+    if target_counts.ne(1).any():
+        raise ValueError(
+            f"Target-date mismatch in {year}"
+        )
+
+    return result.reset_index(drop=True)
 
 
 def load_ensembles(args, legacy):
-    predictions = {}
+    result = {}
 
-    for model in MODELS:
-        root = args.cnn if model == "JKX_CNN" else args.vit
-
+    for model, root in (
+        (MODELS[0], args.cnn),
+        (MODELS[1], args.vit),
+    ):
         frames = [
-            ensemble_preds(root, year, args.seeds, legacy)
-            for year in (2019, 2020, 2021)
+            ensemble_preds(
+                root,
+                year,
+                args.seeds,
+                legacy,
+            )
+            for year in YEARS
         ]
 
-        predictions[model] = pd.concat(
+        result[model] = pd.concat(
             frames,
             ignore_index=True,
         )
 
     cnn = (
-        predictions["JKX_CNN"]
+        result[MODELS[0]]
         .sort_values(KEYS)
         .reset_index(drop=True)
     )
 
     vit = (
-        predictions["DayAligned_ViT"]
+        result[MODELS[1]]
         .sort_values(KEYS)
         .reset_index(drop=True)
     )
 
-    if not cnn[KEYS + ["label"]].equals(vit[KEYS + ["label"]]):
-        raise ValueError("CNN/ViT sample IDs differ")
+    columns = KEYS + ["label"]
+
+    if not cnn[columns].equals(
+        vit[columns]
+    ):
+        raise ValueError(
+            "CNN/ViT samples not aligned"
+        )
 
     if not np.allclose(
         cnn.return_5d,
         vit.return_5d,
-        rtol=0,
         atol=1e-10,
+        rtol=0,
     ):
-        raise ValueError("CNN/ViT future returns differ")
+        raise ValueError(
+            "CNN/ViT returns not aligned"
+        )
 
-    return predictions
+    return result
 
 
-def load_prices(raw_root, legacy):
+def load_prices(raw_root, tickers):
     opens = {}
     closes = {}
 
-    for ticker in sorted(legacy):
+    for ticker in sorted(tickers):
         path = raw_root / f"{ticker}.csv"
 
         if not path.is_file():
             raise FileNotFoundError(path)
 
-        df = pd.read_csv(path)
+        frame = pd.read_csv(path)
 
-        needed = {"Date", "Open", "Close", "Adj Close"}
+        needed = {
+            "Date",
+            "Open",
+            "Close",
+            "Adj Close",
+        }
 
-        if not needed.issubset(df.columns):
-            raise ValueError(f"Missing price columns: {path}")
+        if not needed.issubset(
+            frame.columns
+        ):
+            raise ValueError(
+                f"Missing price fields: {path}"
+            )
 
-        df["Date"] = pd.to_datetime(df["Date"], errors="raise")
+        frame["Date"] = pd.to_datetime(
+            frame.Date,
+            errors="raise",
+        )
 
-        df = df[
-            (df.Date >= "2010-01-01")
-            & (df.Date < "2022-01-01")
+        frame = frame.loc[
+            (frame.Date >= "2010-01-01")
+            & (frame.Date < "2022-01-01")
         ].copy()
 
-        if df.Date.duplicated().any():
-            raise ValueError(f"Duplicate dates: {path}")
+        if frame.Date.duplicated().any():
+            raise ValueError(
+                f"Duplicate date: {ticker}"
+            )
 
-        df = df.set_index("Date").sort_index()
+        frame = (
+            frame.set_index("Date")
+            .sort_index()
+        )
 
-        adjustment = df["Adj Close"] / df["Close"]
+        adjustment = (
+            frame["Adj Close"]
+            / frame["Close"]
+        )
 
-        opens[ticker] = df["Open"] * adjustment
-        closes[ticker] = df["Adj Close"]
+        opens[ticker] = (
+            frame["Open"] * adjustment
+        )
 
-    adj_open = pd.DataFrame(opens).sort_index()
-    adj_close = pd.DataFrame(closes).sort_index()
+        closes[ticker] = (
+            frame["Adj Close"]
+        )
 
-    # Common trading calendar. Never fill missing stock prices.
-    valid_day = (
-        ((adj_open > 0) & (adj_close > 0))
+    adjusted_open = (
+        pd.DataFrame(opens)
+        .sort_index()
+    )
+
+    adjusted_close = (
+        pd.DataFrame(closes)
+        .sort_index()
+    )
+
+    valid = (
+        (
+            (adjusted_open > 0)
+            & (adjusted_close > 0)
+        )
         .sum(axis=1) >= 80
     )
 
-    calendar = adj_close.index[valid_day]
+    calendar = adjusted_close.index[valid]
 
-    adj_open = adj_open.reindex(calendar)
-    adj_close = adj_close.reindex(calendar)
+    adjusted_open = (
+        adjusted_open.reindex(calendar)
+    )
 
-    if calendar.max() >= pd.Timestamp("2022-01-01"):
-        raise ValueError("Holdout price access forbidden")
+    adjusted_close = (
+        adjusted_close.reindex(calendar)
+    )
 
-    returns = adj_close.pct_change(fill_method=None)
+    if (
+        len(calendar) < 1000
+        or calendar.max()
+        >= pd.Timestamp("2022-01-01")
+    ):
+        raise ValueError(
+            "Invalid price calendar "
+            "or holdout contamination"
+        )
 
-    return adj_open, returns, calendar
+    daily_returns = (
+        adjusted_close.pct_change(
+            fill_method=None
+        )
+    )
+
+    return (
+        adjusted_open,
+        daily_returns,
+        calendar,
+    )
 
 
 def rank_features(day):
-    ranks = day.score.rank(method="average")
-    n = len(day)
+    ranks = (
+        day.score.rank(method="average")
+        .to_numpy(float)
+    )
 
-    return (ranks.to_numpy(float) - 0.5) / n - 0.5
+    return (
+        (ranks - 0.5) / len(day)
+        - 0.5
+    )
 
 
-def calibration_table(predictions):
+def calibration_table(
+    predictions,
+    adjusted_open,
+    calendar,
+):
+    """Calculate matured open-to-open returns."""
+
+    day_to_index = {
+        date: i
+        for i, date in enumerate(calendar)
+    }
+
     rows = []
+    skipped = 0
 
     for date, day in predictions.groupby(
         "decision_date",
         sort=True,
     ):
+        decision = pd.Timestamp(date)
+
+        if decision not in day_to_index:
+            raise ValueError(
+                f"Missing calendar date: {date}"
+            )
+
+        index = day_to_index[decision]
+
+        if index + 6 >= len(calendar):
+            skipped += 1
+            continue
+
+        entry_date = calendar[index + 1]
+        maturity_date = calendar[index + 6]
+
+        tickers = day.ticker.tolist()
+
+        entry = adjusted_open.loc[
+            entry_date,
+            tickers,
+        ].to_numpy(float)
+
+        exit_prices = adjusted_open.loc[
+            maturity_date,
+            tickers,
+        ].to_numpy(float)
+
+        valid = (
+            np.isfinite(entry).all()
+            and np.isfinite(exit_prices).all()
+            and (entry > 0).all()
+            and (exit_prices > 0).all()
+        )
+
+        if not valid:
+            skipped += 1
+            continue
+
+        realized = (
+            exit_prices / entry - 1.0
+        )
+
         x = rank_features(day)
 
-        y = day.return_5d.to_numpy(float)
-        y = y - y.mean()
+        y = (
+            realized - realized.mean()
+        )
 
         rows.append({
-            "decision_date": pd.Timestamp(date),
-            "target_date": pd.Timestamp(
-                day.target_date.iloc[0]
-            ),
+            "decision_date": decision,
+            "maturity_date": maturity_date,
             "xy": float(np.dot(x, y)),
             "xx": float(np.dot(x, x)),
         })
 
+    if not rows:
+        raise ValueError(
+            "Empty calibration history"
+        )
+
+    print(
+        f"[CALIB DATA] "
+        f"days={len(rows)} "
+        f"skipped={skipped}",
+        flush=True,
+    )
+
     return (
         pd.DataFrame(rows)
         .sort_values("decision_date")
+        .reset_index(drop=True)
     )
 
 
-def slope_at(calib, current_date, lookback_days, min_days):
-    # Only previously matured future returns are eligible.
-    history = calib[
-        (calib.decision_date < current_date)
-        & (calib.target_date <= current_date)
-    ].tail(lookback_days)
+def slope_at(
+    calibration,
+    decision_date,
+    lookback,
+    minimum,
+):
+    history = calibration.loc[
+        (
+            calibration.decision_date
+            < decision_date
+        )
+        & (
+            calibration.maturity_date
+            <= decision_date
+        )
+    ].tail(lookback)
 
-    if len(history) < min_days:
+    if len(history) < minimum:
         raise ValueError(
-            f"Insufficient calibration history at {current_date}: "
-            f"{len(history)} < {min_days}"
+            f"Only {len(history)} matured "
+            f"calibration dates at {decision_date}; "
+            f"need {minimum}"
         )
 
-    denominator = history.xx.sum()
+    xx = float(history.xx.sum())
 
-    if denominator <= 0:
-        raise ValueError("Degenerate calibration scores")
+    if xx <= 0:
+        raise ValueError(
+            "Degenerate calibration denominator"
+        )
 
-    slope = history.xy.sum() / denominator
+    raw = float(
+        history.xy.sum() / xx
+    )
 
-    return float(np.clip(slope, -0.1, 0.1)), len(history)
+    return (
+        float(np.clip(raw, -0.1, 0.1)),
+        len(history),
+    )
 
 
-def mvo_weights(mu, covariance, risk_aversion, max_weight):
+def mvo_weights(
+    mu,
+    covariance,
+    risk_aversion,
+    max_weight,
+):
     n = len(mu)
 
     if n * max_weight < 1 - 1e-10:
-        raise ValueError("Infeasible weight constraint")
+        raise ValueError(
+            "Infeasible weight bound"
+        )
 
-    initial = np.full(n, 1.0 / n)
+    initial = np.full(
+        n,
+        1.0 / n,
+    )
 
     def objective(w):
         expected_return = float(mu @ w)
-        variance = float(w @ covariance @ w)
+
+        variance = float(
+            w @ covariance @ w
+        )
 
         return (
             -expected_return
@@ -308,17 +560,22 @@ def mvo_weights(mu, covariance, risk_aversion, max_weight):
         )
 
     def gradient(w):
-        return -mu + risk_aversion * (covariance @ w)
+        return (
+            -mu
+            + risk_aversion * (covariance @ w)
+        )
 
-    result = minimize(
+    optimum = minimize(
         objective,
         initial,
         jac=gradient,
         method="SLSQP",
-        bounds=[(0.0, max_weight)] * n,
+        bounds=[
+            (0.0, max_weight)
+        ] * n,
         constraints=[{
             "type": "eq",
-            "fun": lambda w: np.sum(w) - 1.0,
+            "fun": lambda w: w.sum() - 1.0,
             "jac": lambda w: np.ones(n),
         }],
         options={
@@ -328,128 +585,163 @@ def mvo_weights(mu, covariance, risk_aversion, max_weight):
     )
 
     if (
-        not result.success
-        or abs(result.x.sum() - 1.0) > 1e-6
-        or result.x.min() < -1e-7
-        or result.x.max() > max_weight + 1e-6
+        not optimum.success
+        or abs(optimum.x.sum() - 1) > 1e-6
+        or optimum.x.min() < -1e-7
+        or optimum.x.max() > max_weight + 1e-6
     ):
         raise RuntimeError(
-            f"MVO optimization failed: {result.message}"
+            f"MVO failed: {optimum.message}"
         )
 
-    return result.x
+    return optimum.x
 
 
-def rebalance_dates(predictions, offset):
-    dates = sorted(
-        d for d in predictions.decision_date.unique()
-        if "2020-01-01" <= d < "2022-01-01"
+def rebalance_dates(
+    predictions,
+    offset,
+):
+    candidates = sorted(
+        d
+        for d in predictions.decision_date.unique()
+        if "2018-01-01" <= d < "2022-01-01"
     )
 
-    schedules = []
+    schedule = []
 
-    for year in (2020, 2021):
-        annual_dates = [
-            d for d in dates
+    for year in EVAL_YEARS:
+        year_days = [
+            d
+            for d in candidates
             if d.startswith(str(year))
         ]
 
-        schedules.extend(
+        schedule.extend(
             pd.Timestamp(d)
-            for d in annual_dates[offset::5]
+            for d in year_days[offset::5]
         )
 
-    return schedules
+    return schedule
 
 
-def strategy_return(weights, returns):
-    total = float(np.dot(weights, returns))
-
-    if total <= -1:
-        raise ValueError("Invalid portfolio return")
-
-    final_weights = (
-        weights * (1.0 + returns) / (1.0 + total)
+def strategy_return(
+    weights,
+    asset_returns,
+):
+    gross = float(
+        np.dot(weights, asset_returns)
     )
 
-    return total, final_weights
+    if gross <= -1:
+        raise ValueError(
+            "Portfolio gross return <= -100%"
+        )
+
+    end_weights = (
+        weights
+        * (1.0 + asset_returns)
+        / (1.0 + gross)
+    )
+
+    return gross, end_weights
 
 
 def compute_cost_and_update(
     state,
-    current_weights,
-    start,
-    end,
-    ticker_returns,
+    allocation,
+    entry,
+    exit_date,
+    asset_returns,
     cost_bps,
 ):
-    new_map = dict(current_weights)
+    new = dict(allocation)
 
     if state is None:
         turnover = sum(
-            abs(w) for w in new_map.values()
+            abs(w)
+            for w in new.values()
         )
 
     else:
-        previous_end, previous_weights = state
+        last_exit, previous = state
 
-        if previous_end > start:
-            raise ValueError("Overlapping trading periods")
+        if last_exit > entry:
+            raise ValueError(
+                "Overlapping holding windows"
+            )
 
-        if previous_end < start:
+        if last_exit < entry:
             turnover = (
-                sum(abs(w) for w in previous_weights.values())
-                + sum(abs(w) for w in new_map.values())
+                sum(abs(w) for w in previous.values())
+                + sum(abs(w) for w in new.values())
             )
 
         else:
-            tickers = set(previous_weights) | set(new_map)
+            tickers = (
+                set(previous) | set(new)
+            )
 
             turnover = sum(
                 abs(
-                    new_map.get(t, 0.0)
-                    - previous_weights.get(t, 0.0)
+                    new.get(t, 0.0)
+                    - previous.get(t, 0.0)
                 )
                 for t in tickers
             )
 
-    tickers = list(new_map)
+    tickers = list(new)
 
-    weights = np.array([
-        new_map[t] for t in tickers
-    ])
+    weights = np.array(
+        [new[t] for t in tickers],
+        dtype=float,
+    )
 
-    returns = np.array([
-        ticker_returns[t] for t in tickers
-    ])
+    returns = np.array(
+        [asset_returns[t] for t in tickers],
+        dtype=float,
+    )
 
-    gross, final_weights = strategy_return(
+    gross, end_weights = strategy_return(
         weights,
         returns,
     )
 
-    net = gross - turnover * cost_bps / 10000.0
-
-    new_state = (
-        end,
-        dict(zip(tickers, final_weights)),
+    net = (
+        gross
+        - turnover * cost_bps / 10000.0
     )
 
-    return gross, net, turnover, new_state
+    new_state = (
+        exit_date,
+        dict(zip(tickers, end_weights)),
+    )
+
+    return (
+        gross,
+        net,
+        turnover,
+        new_state,
+    )
 
 
-def evaluate(args, predictions, adj_open, daily_returns, calendar):
-    price_index = {
+def evaluate(
+    args,
+    predictions,
+    adjusted_open,
+    daily_returns,
+    calendar,
+):
+    day_index = {
         date: i
         for i, date in enumerate(calendar)
     }
 
     schedule = rebalance_dates(
-        predictions["JKX_CNN"],
+        predictions[MODELS[0]],
         args.offset,
     )
 
-    for model in MODELS:
+    for model in MODELS[1:]:
         dates = rebalance_dates(
             predictions[model],
             args.offset,
@@ -457,99 +749,120 @@ def evaluate(args, predictions, adj_open, daily_returns, calendar):
 
         if dates != schedule:
             raise ValueError(
-                "CNN/ViT decision dates differ"
+                "Model rebalancing calendars differ"
             )
 
-    calibrations = {
-        model: calibration_table(predictions[model])
+    calibration = {
+        model: calibration_table(
+            predictions[model],
+            adjusted_open,
+            calendar,
+        )
         for model in MODELS
     }
 
     lookups = {
         model: {
-            pd.Timestamp(date): day.set_index("ticker")
-            for date, day in predictions[model].groupby(
-                "decision_date"
+            pd.Timestamp(date): day.set_index(
+                "ticker"
             )
+            for date, day in predictions[
+                model
+            ].groupby("decision_date")
         }
         for model in MODELS
     }
 
     records = []
-    weights_data = []
-    slopes = []
-    state = {}
+    weights_rows = []
+    slope_rows = []
+    states = {}
 
-    for trade_number, date in enumerate(schedule, 1):
-        year = date.year
+    for count, decision in enumerate(
+        schedule,
+        1,
+    ):
+        year = decision.year
 
-        if date not in price_index:
+        if decision not in day_index:
             raise ValueError(
-                f"Missing trading date: {date}"
+                f"Missing rebalance date: {decision}"
             )
 
-        loc = price_index[date]
+        i = day_index[decision]
 
-        if loc + 6 >= len(calendar):
+        if i + 6 >= len(calendar):
             continue
 
-        entry = calendar[loc + 1]
-        exit_date = calendar[loc + 6]
+        entry = calendar[i + 1]
+        exit_date = calendar[i + 6]
 
         if (
             exit_date.year != year
-            or exit_date >= pd.Timestamp("2022-01-01")
+            or exit_date
+            >= pd.Timestamp("2022-01-01")
         ):
             continue
 
-        # Historical close-to-close returns known at decision close.
         history = (
-            daily_returns.loc[:date]
+            daily_returns.loc[:decision]
             .tail(args.cov_lookback)
         )
 
         if len(history) != args.cov_lookback:
             raise ValueError(
-                f"Insufficient price history: {date}"
+                f"Insufficient covariance "
+                f"history at {decision}"
             )
 
-        eligible = history.notna().all(axis=0)
+        eligible = (
+            history.notna().all(axis=0)
+        )
 
-        available_tickers = eligible[
-            eligible
-        ].index.tolist()
+        available = (
+            eligible.index[eligible]
+            .tolist()
+        )
 
-        if len(available_tickers) < 80:
+        if len(available) < 80:
             raise ValueError(
-                f"Too few eligible assets at {date}: "
-                f"{len(available_tickers)}"
+                f"Fewer than 80 eligible "
+                f"stocks at {decision}"
             )
 
         allocations = {
             "EW100": dict.fromkeys(
-                available_tickers,
-                1.0 / len(available_tickers),
+                available,
+                1.0 / len(available),
             )
         }
 
         for model in MODELS:
-            day = lookups[model][date].copy()
+            day = lookups[
+                model
+            ][decision].copy()
 
-            slope, calibration_days = slope_at(
-                calibrations[model],
-                date,
+            slope, n_calib = slope_at(
+                calibration[model],
+                decision,
                 args.calib_lookback,
                 args.min_calib_days,
             )
 
-            day["rank_x"] = rank_features(day)
-            day["mu_5d"] = slope * day["rank_x"]
+            day["rank_x"] = rank_features(
+                day
+            )
+
+            day["mu_5d"] = (
+                slope * day.rank_x
+            )
 
             candidates = day.loc[
-                day.index.intersection(available_tickers)
+                day.index.intersection(
+                    available
+                )
             ]
 
-            # Signed historical calibration may reverse the score.
             selected = candidates.sort_values(
                 ["mu_5d", "score"],
                 ascending=[False, False],
@@ -558,117 +871,161 @@ def evaluate(args, predictions, adj_open, daily_returns, calendar):
 
             if len(selected) != args.top_k:
                 raise ValueError(
-                    "Insufficient portfolio candidates"
+                    f"Not enough candidates at "
+                    f"{decision}"
                 )
 
-            tickers = selected.index.tolist()
+            names = selected.index.tolist()
 
-            # 126 historical daily returns only.
-            covariance = (
-                LedoitWolf(store_precision=False)
-                .fit(history[tickers].to_numpy(float))
-                .covariance_ * 5.0
+            cov = (
+                LedoitWolf(
+                    store_precision=False
+                )
+                .fit(
+                    history[names].to_numpy(
+                        float
+                    )
+                )
+                .covariance_
+                * 5.0
             )
 
-            mu = selected.mu_5d.to_numpy(float)
-
-            equal_weights = np.full(
-                args.top_k,
-                1.0 / args.top_k,
+            mu = (
+                selected.mu_5d
+                .to_numpy(float)
             )
 
-            minvar_weights = mvo_weights(
-                np.zeros_like(mu),
-                covariance,
-                1.0,
-                args.max_weight,
-            )
+            strategies = {
+                "Top20_EW": np.full(
+                    args.top_k,
+                    1.0 / args.top_k,
+                ),
 
-            optimized_weights = mvo_weights(
-                mu,
-                covariance,
-                args.risk_aversion,
-                args.max_weight,
-            )
+                "Top20_MinVar": mvo_weights(
+                    np.zeros_like(mu),
+                    cov,
+                    1.0,
+                    args.max_weight,
+                ),
 
-            slopes.append({
-                "date": date.date().isoformat(),
+                "Top20_MVO": mvo_weights(
+                    mu,
+                    cov,
+                    args.risk_aversion,
+                    args.max_weight,
+                ),
+            }
+
+            slope_rows.append({
                 "year": year,
+                "date": (
+                    decision.date().isoformat()
+                ),
                 "model": model,
                 "slope": slope,
-                "calibration_days": calibration_days,
+                "calibration_days": n_calib,
             })
 
-            strategies = (
-                ("Top20_EW", equal_weights),
-                ("Top20_MinVar", minvar_weights),
-                ("Top20_MVO", optimized_weights),
-            )
-
-            for strategy, weights in strategies:
-                name = f"{model}_{strategy}"
-
-                allocations[name] = dict(
-                    zip(tickers, weights)
+            for strategy, weights in (
+                strategies.items()
+            ):
+                full_name = (
+                    f"{model}_{strategy}"
                 )
 
-                for ticker, weight in zip(tickers, weights):
-                    weights_data.append({
+                allocations[full_name] = dict(
+                    zip(names, weights)
+                )
+
+                for ticker, weight in zip(
+                    names,
+                    weights,
+                ):
+                    weights_rows.append({
                         "year": year,
-                        "date": date.date().isoformat(),
-                        "strategy": name,
+                        "date": (
+                            decision.date()
+                            .isoformat()
+                        ),
+                        "strategy": full_name,
                         "ticker": ticker,
                         "weight": float(weight),
                         "mu_5d": float(
-                            selected.loc[ticker, "mu_5d"]
+                            selected.loc[
+                                ticker,
+                                "mu_5d",
+                            ]
                         ),
                     })
 
-        # Realized future prices are used only after
-        # allocations have been finalized.
-        needed = set().union(
-            *(set(a) for a in allocations.values())
+        needed = sorted(
+            set().union(
+                *(
+                    set(a)
+                    for a in allocations.values()
+                )
+            )
         )
 
-        ordered = sorted(needed)
+        entry_px = adjusted_open.loc[
+            entry,
+            needed,
+        ]
 
-        entry_prices = adj_open.loc[entry, ordered]
-        exit_prices = adj_open.loc[exit_date, ordered]
+        exit_px = adjusted_open.loc[
+            exit_date,
+            needed,
+        ]
 
-        if (
-            entry_prices.isna().any()
-            or exit_prices.isna().any()
-            or (entry_prices <= 0).any()
-            or (exit_prices <= 0).any()
-        ):
+        invalid_prices = (
+            entry_px.isna().any()
+            or exit_px.isna().any()
+            or (entry_px <= 0).any()
+            or (exit_px <= 0).any()
+        )
+
+        if invalid_prices:
             raise ValueError(
-                f"Unexecutable stock at {date.date()}; "
-                "do not exclude it using future data"
+                f"Unexecutable trade on "
+                f"{decision.date()}; "
+                f"do not drop positions "
+                f"using future prices"
             )
 
-        asset_returns = (
-            exit_prices / entry_prices - 1.0
+        realized = (
+            exit_px / entry_px - 1.0
         ).to_dict()
 
-        for name, allocation in allocations.items():
-            key = (year, name)
+        for name, allocation in (
+            allocations.items()
+        ):
+            state_key = (
+                year,
+                name,
+            )
 
-            gross, net, turnover, state[key] = (
-                compute_cost_and_update(
-                    state.get(key),
-                    allocation,
-                    entry,
-                    exit_date,
-                    asset_returns,
-                    args.cost_bps,
-                )
+            gross, net, turnover, states[
+                state_key
+            ] = compute_cost_and_update(
+                states.get(state_key),
+                allocation,
+                entry,
+                exit_date,
+                realized,
+                args.cost_bps,
             )
 
             records.append({
                 "year": year,
-                "date": date.date().isoformat(),
-                "entry_open": entry.date().isoformat(),
-                "exit_open": exit_date.date().isoformat(),
+                "date": (
+                    decision.date().isoformat()
+                ),
+                "entry_open": (
+                    entry.date().isoformat()
+                ),
+                "exit_open": (
+                    exit_date.date().isoformat()
+                ),
                 "strategy": name,
                 "n_positions": len(allocation),
                 "gross_return": gross,
@@ -676,48 +1033,61 @@ def evaluate(args, predictions, adj_open, daily_returns, calendar):
                 "turnover": turnover,
             })
 
-        if trade_number == 1 or trade_number % 10 == 0:
+        if (
+            count == 1
+            or count % 10 == 0
+        ):
             print(
-                f"[REBAL] {trade_number}/{len(schedule)} "
-                f"{date.date()} "
-                f"eligible={len(available_tickers)}",
+                f"[REBAL] "
+                f"{count}/{len(schedule)} "
+                f"{decision.date()} "
+                f"eligible={len(available)}",
                 flush=True,
             )
 
     if not records:
-        raise RuntimeError("No evaluated trading periods")
+        raise RuntimeError(
+            "No portfolio rebalances"
+        )
 
     results = pd.DataFrame(records)
 
-    # Final liquidation cost at the end of each evaluation year.
+    # Charge year-end liquidation cost.
     if args.cost_bps:
-        for (_, _), group in results.groupby(
+        grouped = results.groupby(
             ["year", "strategy"]
-        ):
+        )
+
+        for _, group in grouped:
             last = group.index[-1]
 
-            results.loc[last, "net_return"] -= (
+            results.loc[
+                last,
+                "net_return",
+            ] -= (
                 args.cost_bps / 10000.0
             )
 
-            results.loc[last, "turnover"] += 1.0
+            results.loc[
+                last,
+                "turnover",
+            ] += 1.0
 
     return (
         results,
-        pd.DataFrame(weights_data),
-        pd.DataFrame(slopes),
+        pd.DataFrame(weights_rows),
+        pd.DataFrame(slope_rows),
     )
 
 
 def summarize(results):
     rows = []
-    annualization = 252.0 / 5.0
 
     annual = [
         (str(year), strategy, group)
-        for (year, strategy), group in results.groupby(
-            ["year", "strategy"],
-            sort=True,
+        for (year, strategy), group
+        in results.groupby(
+            ["year", "strategy"]
         )
     ]
 
@@ -725,54 +1095,73 @@ def summarize(results):
         (
             "ALL",
             strategy,
-            group.sort_values(["year", "entry_open"]),
+            group.sort_values(
+                ["year", "entry_open"]
+            ),
         )
-        for strategy, group in results.groupby(
-            "strategy",
-            sort=True,
-        )
+        for strategy, group
+        in results.groupby("strategy")
     ]
 
-    for period, strategy, group in annual + combined:
-        returns = group.net_return.to_numpy(float)
-        gross = group.gross_return.to_numpy(float)
-
-        volatility = float(
-            np.std(returns, ddof=1)
+    for period, strategy, group in (
+        annual + combined
+    ):
+        net = (
+            group.net_return
+            .to_numpy(float)
         )
 
-        sharpe = (
+        gross = (
+            group.gross_return
+            .to_numpy(float)
+        )
+
+        sd = (
             float(
-                np.mean(returns)
-                / volatility
-                * np.sqrt(annualization)
+                np.std(net, ddof=1)
             )
-            if volatility > 0
+            if len(net) > 1
             else np.nan
         )
 
         wealth = np.r_[
             1.0,
-            np.cumprod(1.0 + returns),
+            np.cumprod(1.0 + net),
         ]
 
         drawdown = (
-            wealth / np.maximum.accumulate(wealth) - 1.0
+            wealth
+            / np.maximum.accumulate(wealth)
+            - 1.0
+        )
+
+        sharpe = (
+            float(
+                net.mean()
+                / sd
+                * np.sqrt(252.0 / 5.0)
+            )
+            if sd > 0
+            else np.nan
         )
 
         rows.append({
             "period": period,
             "strategy": strategy,
             "periods": len(group),
-            "cumulative_net": float(wealth[-1] - 1.0),
+            "cumulative_net": float(
+                wealth[-1] - 1.0
+            ),
             "cumulative_gross": float(
                 np.prod(1.0 + gross) - 1.0
             ),
             "sharpe_net": sharpe,
-            "annualized_vol_net": (
-                volatility * np.sqrt(annualization)
+            "annualized_vol_net": float(
+                sd * np.sqrt(252.0 / 5.0)
             ),
-            "max_drawdown_net": float(drawdown.min()),
+            "max_drawdown_net": float(
+                drawdown.min()
+            ),
             "mean_turnover": float(
                 group.turnover.mean()
             ),
@@ -787,31 +1176,41 @@ def main():
     parser.add_argument(
         "--cnn",
         type=Path,
-        default=Path("outputs/exp200_factorial"),
+        default=Path(
+            "outputs/exp200_factorial"
+        ),
     )
 
     parser.add_argument(
         "--vit",
         type=Path,
-        default=Path("outputs/exp200_day_vit"),
+        default=Path(
+            "outputs/exp200_day_vit"
+        ),
     )
 
     parser.add_argument(
         "--raw",
         type=Path,
-        default=Path("data/exp200/raw"),
+        default=Path(
+            "data/exp200/raw"
+        ),
     )
 
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("data/exp200/universe200.csv"),
+        default=Path(
+            "data/exp200/universe200.csv"
+        ),
     )
 
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("outputs/exp200_mvo_compare"),
+        default=Path(
+            "outputs/exp200_mvo_2018_2021"
+        ),
     )
 
     parser.add_argument(
@@ -872,19 +1271,28 @@ def main():
 
     args = parser.parse_args()
 
-    if (
+    invalid = (
         len(args.seeds) != 3
         or len(set(args.seeds)) != 3
         or args.top_k < 10
+        or args.top_k > 100
         or args.max_weight <= 0
-        or args.top_k * args.max_weight < 1 - 1e-8
+        or (
+            args.top_k * args.max_weight
+            < 1 - 1e-8
+        )
         or args.cov_lookback < 10
         or args.min_calib_days < 1
-        or args.calib_lookback < args.min_calib_days
+        or args.calib_lookback
+        < args.min_calib_days
         or args.risk_aversion <= 0
         or args.cost_bps < 0
-    ):
-        parser.error("Invalid strategy parameters or seeds")
+    )
+
+    if invalid:
+        parser.error(
+            "Invalid portfolio parameters"
+        )
 
     manifest = pd.read_csv(
         args.manifest,
@@ -898,7 +1306,10 @@ def main():
         len(manifest) != 200
         or manifest.ticker.nunique() != 200
     ):
-        raise ValueError("Invalid 200-stock manifest")
+        raise ValueError(
+            "Expected locked "
+            "200-stock manifest"
+        )
 
     legacy = set(
         manifest.loc[
@@ -908,23 +1319,33 @@ def main():
     )
 
     if len(legacy) != 100:
-        raise ValueError("Expected exactly 100 legacy stocks")
+        raise ValueError(
+            "Expected 100 common stocks"
+        )
 
-    predictions = load_ensembles(args, legacy)
-
-    adj_open, daily_returns, calendar = load_prices(
-        args.raw,
+    predictions = load_ensembles(
+        args,
         legacy,
     )
 
+    adjusted_open, returns, calendar = (
+        load_prices(
+            args.raw,
+            legacy,
+        )
+    )
+
     print(
-        "[DATA] Common100 | CNN/ViT 3-Seed ensembles | "
-        "2019 calibration | 2020-2021 evaluation",
+        "[DATA] Common100 | "
+        "CNN/ViT 3-seed ensembles | "
+        "2017 initial calibration | "
+        "2018-2021 evaluation",
         flush=True,
     )
 
     print(
-        f"[CONFIG] top_k={args.top_k} "
+        f"[CONFIG] "
+        f"top_k={args.top_k} "
         f"max_weight={args.max_weight} "
         f"risk_aversion={args.risk_aversion} "
         f"cov_lookback={args.cov_lookback} "
@@ -936,8 +1357,8 @@ def main():
     results, weights, slopes = evaluate(
         args,
         predictions,
-        adj_open,
-        daily_returns,
+        adjusted_open,
+        returns,
         calendar,
     )
 
@@ -946,6 +1367,29 @@ def main():
     args.out.mkdir(
         parents=True,
         exist_ok=True,
+    )
+
+    config = vars(args).copy()
+
+    config.update({
+        "initial_calibration_year": 2017,
+        "evaluation_years": list(EVAL_YEARS),
+        "calibration_target":
+            "adjusted_open_t1_to_t6",
+        "year_end_liquidation": True,
+    })
+
+    config_path = (
+        args.out / "config.json"
+    )
+
+    config_path.write_text(
+        json.dumps(
+            config,
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
     )
 
     results.to_csv(
@@ -976,7 +1420,10 @@ def main():
         ])
     ]
 
-    print("\n[MVO RESULTS]", flush=True)
+    print(
+        "\n[MVO RESULTS]",
+        flush=True,
+    )
 
     print(
         focus.to_string(
@@ -986,35 +1433,62 @@ def main():
         flush=True,
     )
 
-    benchmarks = summary[
+    benchmark = summary[
         summary.strategy.str.contains(
             "Top20_EW|Top20_MinVar"
         )
     ]
 
-    print("\n[TOP20 BENCHMARKS]", flush=True)
+    print(
+        "\n[TOP20 BENCHMARKS]",
+        flush=True,
+    )
 
     print(
-        benchmarks.to_string(
+        benchmark.to_string(
             index=False,
             float_format=lambda x: f"{x:+.5f}",
         ),
         flush=True,
     )
 
-    print("\n[CALIBRATION]", flush=True)
+    print(
+        "\n[CALIBRATION]",
+        flush=True,
+    )
 
     print(
-        slopes.groupby(["year", "model"])
-        .slope.agg(["mean", "min", "max"])
+        slopes.groupby(
+            ["year", "model"]
+        )
+        .slope.agg([
+            "mean",
+            "min",
+            "max",
+        ])
         .to_string(
             float_format=lambda x: f"{x:+.6f}"
         ),
         flush=True,
     )
 
-    print(f"\n[SAVED] {args.out}", flush=True)
-    print("[HOLDOUT] 2022-2025 untouched")
+    print(
+        f"\n[SAVED] {args.out}",
+        flush=True,
+    )
+
+    print(
+        "[LIMITATIONS] Survivor-only stocks; "
+        "yearly trading gaps; "
+        "MDD based on 5-session "
+        "portfolio returns",
+        flush=True,
+    )
+
+    print(
+        "[HOLDOUT] 2022-2025 untouched",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
